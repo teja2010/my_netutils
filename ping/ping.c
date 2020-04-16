@@ -211,9 +211,11 @@ int send_ping(struct ping_cb *pc)
 	return rc;
 }
 
-int check_response(struct ping_cb *pc, uint8_t *payload, int len, int *ttl)
+int check_response(struct ping_cb *pc, struct msghdr *msg, int len, int *ttl)
 {
+	uint8_t *payload = msg->msg_iov->iov_base;
 	uint8_t ipversion = payload[0]&0xf0;
+	struct cmsghdr *cmsg;
 	//if(ipversion != 0x40 && ipversion != 0x60)
 	//	return -1; //non-ip packet
 
@@ -231,7 +233,7 @@ int check_response(struct ping_cb *pc, uint8_t *payload, int len, int *ttl)
 						ip_hdr_size(payload + offset,
 							    len - offset));
 			if(hdr->un.echo.id == htons(pc->id) &&
-			   hdr->un.echo.sequence != htons(pc->seq)) {
+			   hdr->un.echo.sequence == htons(pc->seq)) {
 				return ICMP_TIME_EXCEEDED;
 			}
 			return -1;
@@ -247,20 +249,31 @@ int check_response(struct ping_cb *pc, uint8_t *payload, int len, int *ttl)
 		return -1;
 
 	} else {
-		// IPv6 header is missing , check
-		//struct ipv6hdr *ip6h = (struct ipv6hdr*)payload;
 		struct icmp6hdr *hdr = (struct icmp6hdr*) payload;
 					//(payload + ip_hdr_size(payload, len));
+		for(cmsg =CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+			if(cmsg->cmsg_level == SOL_IPV6 &&
+			   cmsg->cmsg_type == IPV6_HOPLIMIT) {
+				memcpy(ttl, CMSG_DATA(cmsg), sizeof(int));
+			}
+		}
 
 		if(hdr->icmp6_type == ICMPV6_EXC_HOPLIMIT) {
-			//TODO
+			int offset = sizeof(struct icmp6hdr);
+			hdr = (struct icmp6hdr*)(payload + offset
+						 + ip_hdr_size(payload + offset,
+								len - offset));
+			if(hdr->icmp6_type == ICMPV6_ECHO_REPLY &&
+			   hdr->icmp6_dataun.u_echo.identifier == htons(pc->id) &&
+			   hdr->icmp6_dataun.u_echo.sequence == htons(pc->seq)) {
+				return ICMP_TIME_EXCEEDED;
+			}
 			return -1;
 		}
 
 		if(hdr->icmp6_type == ICMPV6_ECHO_REPLY &&
 		   hdr->icmp6_dataun.u_echo.identifier == htons(pc->id) &&
 		   hdr->icmp6_dataun.u_echo.sequence == htons(pc->seq)) {
-			//*ttl = ip6h->hop_limit;
 			return ICMP_ECHOREPLY;
 		}
 
@@ -278,7 +291,6 @@ void recv_ping(struct ping_cb *pc)
 	//struct icmphdr *hdr;
 	struct iovec iov;
 	struct msghdr msg;
-	struct cmsghdr *cmsg;
 
 	iov.iov_base = payload;
 	iov.iov_len = 1500;
@@ -310,13 +322,13 @@ void recv_ping(struct ping_cb *pc)
 
 		//received a response.
 		memset(payload, 0, 1500);
-		rc = recv(pc->fd, payload, 1500, 0);
+		rc = recvmsg(pc->fd, &msg, MSG_DONTWAIT);
 		if(rc <= 0) {
 			continue;
 		}
 		gettimeofday(&rcv_tv, NULL);
 
-		switch(check_response(pc, payload, rc, &ttl)) {
+		switch(check_response(pc, &msg, rc, &ttl)) {
 		case ICMP_TIME_EXCEEDED:
 		{
 			printf("TTL exceeded\tseq=%d\n", pc->seq);
@@ -329,9 +341,13 @@ void recv_ping(struct ping_cb *pc)
 
 		case ICMP_ECHOREPLY:
 		{
+			float diff = 0;
+			diff = (rcv_tv.tv_sec - pc->send_time.tv_sec)*1000000;
+			diff += rcv_tv.tv_usec;
+			diff -= pc->send_time.tv_usec;
+			printf("received reply\t seq=%d, ttl=%d, rtt=%.3fms\n",
+					pc->seq, ttl, diff/1000);
 			update_stats(pc, &rcv_tv);
-			printf("received reply\t seq=%d, ttl=%d\n",
-					pc->seq, ttl);
 			if(tv.tv_sec)
 				sleep(tv.tv_sec);
 			usleep(tv.tv_usec);
@@ -540,6 +556,11 @@ int main(int argc, char* argv[])
 	if(pc == NULL) {
 		printf("Unable to Allocate memory: %m");
 		exit(EXIT_FAILURE);
+	}
+
+	if(argc == 2 &&
+	   (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+		printhelp();
 	}
 
 	// read arguments, fill up config.

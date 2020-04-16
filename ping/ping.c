@@ -5,6 +5,7 @@
 #include <sys/time.h>
 //#include <linux/time.h>
 //#include <linux/in.h>
+#include <errno.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/in6.h>
@@ -29,7 +30,7 @@ struct ping_cb {
 		struct sockaddr_storage superset;
 	};
 	int ttl;
-	int interval;
+	long int interval;
 	char *remote_address;
 
 	// internal values
@@ -69,6 +70,7 @@ void printhelp()
 	printf("ping Usage:\n");
 	printf("ping [-4] [-t ttl] [-i interval(milliseconds)] IPv4_address\n");
 	printf("ping  -6  [-t ttl] [-i interval(milliseconds)] IPv6_address\n");
+	exit(EXIT_FAILURE);
 }
 
 int ip_hdr_size(uint8_t *payload, int len)
@@ -272,7 +274,22 @@ void recv_ping(struct ping_cb *pc)
 	fd_set readfds;
 	struct timeval tv;
 	uint8_t payload[1500];
+	uint8_t cbuf[1000];
 	//struct icmphdr *hdr;
+	struct iovec iov;
+	struct msghdr msg;
+	struct cmsghdr *cmsg;
+
+	iov.iov_base = payload;
+	iov.iov_len = 1500;
+
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cbuf;
+	msg.msg_controllen = 1000;
+	msg.msg_flags = 0;
 
 	memset(payload, 0, 1500);
 	memset(&tv, 0, sizeof(struct timeval));
@@ -368,7 +385,6 @@ void get_pc_sockaddr(struct ping_cb *pc, int family)
 		printf("inet_ntop error: %m\n");
 		exit(EXIT_FAILURE);
 	}
-	printf("%s resolved2 to %s\n", pc->remote_address, addr_str);
 
 	freeaddrinfo(result);
 
@@ -387,7 +403,6 @@ void read_config(struct ping_cb *pc, int argc, char *argv[], char* rem_addr)
 
 	if(argc < 0 || argc > 5) {
 		printhelp();
-		exit(EXIT_FAILURE);
 	}
 
 	//set a few default options
@@ -400,7 +415,66 @@ void read_config(struct ping_cb *pc, int argc, char *argv[], char* rem_addr)
 
 	//read the configs and change ping_cb's values
 	while(argidx < argc) {
-		//if(
+		if(strcmp(argv[argidx], "-6") == 0) { // -v6
+			pc->sin.sin_family = AF_INET6;
+			argidx++;
+			continue;
+		}
+
+		if(strcmp(argv[argidx], "-4") == 0) { // -v4
+			pc->sin.sin_family = AF_INET;
+			argidx++;
+			continue;
+		}
+
+		if(strcmp(argv[argidx], "-t") == 0) { // ttl
+			int ttl = 0;
+			char *endptr = NULL;
+			if(argidx +1 >= argc) {
+				printf("TTL value missing\n");
+				printhelp();
+			}
+
+			errno = 0;
+			ttl = (int)strtol(argv[argidx+1], &endptr, 10);
+			if(endptr == argv[argidx+1] || errno != 0 ||
+			   ttl < 0 || ttl > 0xff) {
+				printf("TTL value invalid\n");
+				printhelp();
+			}
+
+			pc->ttl = ttl;
+			argidx += 2;
+			continue;
+		}
+
+		if(strcmp(argv[argidx], "-i") == 0) { // interval
+			long int interval = 0;
+			char *endptr = NULL;
+			if(argidx + 1 >= argc) {
+				printf("Interval value missing\n");
+				printhelp();
+			}
+
+			errno = 0;
+			interval = strtol(argv[argidx+1], &endptr, 10);
+			if(endptr == argv[argidx+1] || errno != 0 || interval<0) {
+				printf("Interval value invalid\n");
+				printhelp();
+			}
+			if(interval < 100) {
+				printf("Warning: Interval less than 100ms. "
+					"Ping does not support multiple packets in air.\n"
+					"Packets may incorrectly be classified as timeouts.\n");
+			}
+
+			pc->interval = interval;
+			argidx += 2;
+			continue;
+		}
+
+		printf("Invalid Parameter %s\n", argv[argidx]);
+		printhelp();
 	}
 
 	pc->remote_address = (char*)calloc(strlen(rem_addr)+1, sizeof(char));
@@ -415,16 +489,29 @@ void read_config(struct ping_cb *pc, int argc, char *argv[], char* rem_addr)
 		exit(EXIT_FAILURE);
 	}
 
-	//////set a ICMP filter to only receive ICMP ECHO & TTL exceeded messages
-	//if(pc->sin.sin_family == AF_INET) {
-	//	uint32_t flags = ~(1<<ICMP_ECHOREPLY | 1<<ICMP_TIME_EXCEEDED);
-	//	rc = setsockopt(pc->fd, SOL_RAW, ICMP_FILTER, &flags,
-	//			sizeof(flags));
-	//	if(rc == -1) {
-	//		printf("Unable to set ICMP_FILTER: %m");
-	//		exit(EXIT_FAILURE);
-	//	}
-	//}
+	////set a ICMP filter to only receive ICMP ECHO & TTL exceeded messages
+	if(pc->sin.sin_family == AF_INET) {
+		uint32_t flags = ~(1<<ICMP_ECHOREPLY | 1<<ICMP_TIME_EXCEEDED);
+		rc = setsockopt(pc->fd, SOL_RAW, ICMP_FILTER, &flags,
+				sizeof(flags));
+		if(rc == -1) {
+			printf("Unable to set ICMP_FILTER: %m");
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		int set = 1;
+		rc = setsockopt(pc->fd, IPPROTO_IPV6, IPV6_HOPLIMIT,
+				&set, sizeof(set));
+		if(rc == -1) {
+			//printf("Unable to set IPV6_HOPLIMIT\n");
+		}
+
+		rc = setsockopt(pc->fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT,
+				&set, sizeof(set));
+		if(rc == -1) {
+			//printf("Unable to set IPV6_RECVHOPLIMIT\n");
+		}
+	}
 
 	////set ttl
 	{
